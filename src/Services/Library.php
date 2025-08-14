@@ -1,126 +1,103 @@
 <?php
 namespace LibrarySystem\Services;
 
-use LibrarySystem\Entities\{Book, User, Member, Librarian};
-use LibrarySystem\Interfaces\NotificationChannel;
+use LibrarySystem\Entities\Book;
+use LibrarySystem\Entities\User;
+use LibrarySystem\Entities\Member;
 use LibrarySystem\Traits\LoggerTrait;
+use LibrarySystem\Traits\IdGeneratorTrait;
+use LibrarySystem\Notifications\NotificationInterface;
 
-class Library
-{
-    use LoggerTrait;
+class Library {
+    use LoggerTrait, IdGeneratorTrait;
 
-    /** @var array<string,Book> */
+    /** @var Book[] */
     private array $books = [];
-    /** @var array<string,User> */
-    private array $users = [];
-    /** @var array<string,Loan> Active loans indexed by bookId */
-    private array $loans = [];
+    private NotificationInterface $notifier;
 
-    private ?NotificationChannel $notifier = null;
-
-    public function setNotifier(NotificationChannel $channel): void
-    {
-        $this->notifier = $channel;
+    public function __construct(NotificationInterface $notifier) {
+        $this->notifier = $notifier;
     }
 
-    // Books
-    public function addBook(Book $book, User $by): void
-    {
-        if (!$by instanceof Librarian) {
-            throw new \RuntimeException('Only librarians can add books');
-        }
-        $this->books[$book->getId()] = $book;
-        $this->log("Book added: {$book->getTitle()} by {$by->getName()}");
+    public function notify(string $message): void {
+        $this->notifier->send($message);
     }
 
-    public function removeBook(string $bookId, User $by): void
-    {
-        if (!$by instanceof Librarian) {
-            throw new \RuntimeException('Only librarians can remove books');
-        }
-        unset($this->books[$bookId]);
-        $this->log("Book removed: $bookId by {$by->getName()}");
+    public function addBook(string $title, string $author): void {
+        $book = new Book($this->generateId(), $title, $author);
+        $this->books[] = $book;
+        $this->log("Book '{$title}' added.");
+        $this->notify("تمت إضافة الكتاب: '{$title}'.");
     }
 
     /** @return Book[] */
-    public function search(string $term): array
-    {
-        $t = mb_strtolower(trim($term));
-        return array_values(array_filter($this->books, function (Book $b) use ($t) {
-            return str_contains(mb_strtolower($b->getTitle()), $t)
-                || str_contains(mb_strtolower($b->getAuthor()), $t);
-        }));
+    public function getBooks(): array {
+        return $this->books;
     }
 
     /** @return Book[] */
-    public function listBooks(?string $sortBy = null): array
-    {
-        $books = array_values($this->books);
-        if ($sortBy === 'title') {
-            usort($books, fn($a,$b)=>strcmp($a->getTitle(), $b->getTitle()));
-        } elseif ($sortBy === 'author') {
-            usort($books, fn($a,$b)=>strcmp($a->getAuthor(), $b->getAuthor()));
-        } elseif ($sortBy === 'year') {
-            usort($books, fn($a,$b)=>$a->getYear() <=> $b->getYear());
+    public function searchBooks(string $keyword): array {
+        $keyword = trim($keyword);
+        if ($keyword === '') return $this->books;
+
+        $results = array_filter($this->books, function (Book $book) use ($keyword) {
+            return stripos($book->getTitle(), $keyword) !== false
+                || stripos($book->getAuthor(), $keyword) !== false;
+        });
+
+        if (!$results) {
+            $this->notify("لا يوجد كتاب يطابق: '{$keyword}'.");
         }
-        return $books;
+        return $results;
     }
 
-    // Users
-    public function addUser(User $user): void
-    {
-        $this->users[$user->getId()] = $user;
-        $this->log("User added: {$user->getName()} ({$user->getRole()})");
+    public function removeBook(string $id): void {
+        foreach ($this->books as $i => $book) {
+            if ($book->getId() === $id) {
+                unset($this->books[$i]);
+                $this->books = array_values($this->books);
+                $this->log("Book with ID {$id} removed.");
+                $this->notify("تم حذف الكتاب (ID: {$id}).");
+                return;
+            }
+        }
+        $this->notify("الكتاب المطلوب حذفه غير موجود (ID: {$id}).");
     }
 
-    public function getUser(string $id): ?User
-    {
-        return $this->users[$id] ?? null;
+    public function borrowBook(string $id, User $user): void {
+        if (!($user instanceof Member)) {
+            $this->notify("فقط الأعضاء يمكنهم الاستعارة.");
+            return;
+        }
+
+        foreach ($this->books as $book) {
+            if ($book->getId() === $id) {
+                if (!$book->isAvailable()) {
+                    $this->notify("هذا الكتاب مُستعار بالفعل.");
+                    return;
+                }
+                $book->borrow();
+                $this->log("{$user->getName()} borrowed '{$book->getTitle()}' (ID: {$id}).");
+                $this->notify("تمت الاستعارة: '{$book->getTitle()}'.");
+                return;
+            }
+        }
+        $this->notify("الكتاب غير موجود (ID: {$id}).");
     }
 
-    // Borrow / Return (role-specific behavior)
-    public function borrow(string $bookId, Member $member): Loan
-    {
-        if (!$member->isMembershipActive()) {
-            throw new \RuntimeException('Membership expired');
+    public function returnBook(string $id, User $user): void {
+        foreach ($this->books as $book) {
+            if ($book->getId() === $id) {
+                if ($book->isAvailable()) {
+                    $this->notify("هذا الكتاب غير مُستعار.");
+                    return;
+                }
+                $book->returnBook();
+                $this->log("{$user->getName()} returned '{$book->getTitle()}' (ID: {$id}).");
+                $this->notify("تمت إعادة الكتاب: '{$book->getTitle()}'.");
+                return;
+            }
         }
-        $book = $this->books[$bookId] ?? null;
-        if (!$book || !$book->isAvailable()) {
-            throw new \RuntimeException('Book not available');
-        }
-        // enforce borrow limit
-        $currentLoans = array_filter($this->loans, fn(Loan $l)=>$l->getMember()->getId()===$member->getId() && $l->getReturnedAt()===null);
-        if (count($currentLoans) >= $member->getBorrowLimit()) {
-            throw new \RuntimeException('Borrow limit reached');
-        }
-
-        $loan = new Loan($book, $member);
-        $this->loans[$book->getId()] = $loan;
-        $book->markBorrowed();
-        $this->log("Borrowed: {$book->getTitle()} by {$member->getName()}");
-
-        if ($this->notifier) {
-            $this->notifier->send($member->getEmail(), 'Borrowed Book', 'You borrowed: '.$book->getTitle());
-        }
-        return $loan;
-    }
-
-    public function return(string $bookId, Member $member): float
-    {
-        $loan = $this->loans[$bookId] ?? null;
-        if (!$loan || $loan->getMember()->getId() !== $member->getId()) {
-            throw new \RuntimeException('No active loan for this member/book');
-        }
-        $loan->markReturned();
-        $loan->getBook()->markReturned();
-        $fee = $loan->calculateLateFee();
-        $this->log("Returned: {$loan->getBook()->getTitle()} by {$member->getName()} | Fee: $fee");
-        return $fee;
-    }
-
-    /** @return Loan[] */
-    public function getLoans(): array
-    {
-        return array_values($this->loans);
+        $this->notify("الكتاب غير موجود (ID: {$id}).");
     }
 }
