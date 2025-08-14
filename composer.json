@@ -1,0 +1,11 @@
+{
+  "name": "yourname/library-system",
+  "description": "Simple PHP OOP Library System (PSR-4)",
+  "type": "project",
+  "require": {},
+  "autoload": {
+    "psr-4": {
+      "LibrarySystem\\": "src/"
+    }
+  }
+}
